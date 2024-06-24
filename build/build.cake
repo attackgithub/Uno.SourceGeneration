@@ -1,6 +1,6 @@
-#addin "nuget:?package=Cake.FileHelpers"
-#addin "nuget:?package=Cake.Powershell"
-#tool "nuget:?package=GitVersion.CommandLine&version=3.6.5"
+#addin "nuget:?package=Cake.FileHelpers&version=3.2.1"
+#addin "nuget:?package=Cake.Powershell&version=0.4.8"
+#tool "nuget:?package=GitVersion.CommandLine&version=5.0.1"
 
 using System;
 using System.Linq;
@@ -13,19 +13,12 @@ using System.Text.RegularExpressions;
 var target = Argument("target", "Default");
 
 //////////////////////////////////////////////////////////////////////
-// VERSIONS
-//////////////////////////////////////////////////////////////////////
-
-var gitVersioningVersion = "2.0.41";
-var signClientVersion = "0.9.0";
-
-//////////////////////////////////////////////////////////////////////
 // VARIABLES
 //////////////////////////////////////////////////////////////////////
 
 var baseDir = MakeAbsolute(Directory("../")).ToString();
 var buildDir = baseDir + "/build";
-var Solution = baseDir + "/src/Uno.SourceGenerator.sln";
+var Solution = baseDir + "/src/Uno.SampleCoreApp";
 var toolsDir = buildDir + "/tools";
 GitVersion versionInfo = null;
 
@@ -90,28 +83,16 @@ Task("Build")
 {
 	Information("\nBuilding Solution");
 
-	var buildSettings = new MSBuildSettings
+	var settings = new DotNetCoreBuildSettings
 	{
-		MaxCpuCount = 1
-	}
-	.SetConfiguration("Release")
-	.WithTarget("Restore");
-	
-	MSBuild(Solution, buildSettings);
+		Configuration = "Release",
+	};
 
-	buildSettings = new MSBuildSettings
-	{
-		MaxCpuCount = 1
-	}
-	.SetPlatformTarget(PlatformTarget.x86)
-	.SetConfiguration("Release")
-	.WithTarget("Build");
-	
-	MSBuild(Solution, buildSettings);
+	DotNetCoreBuild(Solution, settings);
 
 	var nuGetPackSettings = new NuGetPackSettings
 	{
-	  Version = versionInfo.FullSemVer,
+	  Version = versionInfo.SemVer,
 	};
 
 	var nugetFilePaths = GetFiles("./*.nuspec");
@@ -140,10 +121,11 @@ Task("Version")
 {
 	versionInfo = GitVersion(new GitVersionSettings {
 		UpdateAssemblyInfo = true,
+		LogFilePath = System.IO.Path.Combine(EnvironmentVariable("BUILD_ARTIFACTSTAGINGDIRECTORY"), "GitVersionLog.txt"),
 		UpdateAssemblyInfoFilePath = baseDir + "/build/AssemblyVersion.cs"
 	});
 
-	Information($"FullSemVer: {versionInfo.FullSemVer} Sha: {versionInfo.Sha}");
+	Information($"SemVer: {versionInfo.SemVer} Sha: {versionInfo.Sha}");
 
 	var files = new[] {
 		@"..\src\Uno.SourceGeneratorTasks.Dev15.0\Content\Uno.SourceGenerationTasks.targets",

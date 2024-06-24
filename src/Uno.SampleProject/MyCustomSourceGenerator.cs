@@ -22,6 +22,7 @@ namespace Uno.SampleProject
 	{
 		public MyCustomSourceGenerator()
 		{
+			Debug.WriteLine(Test.MyGeneratedType.Project);
 			Debug.WriteLine(Test.MyGeneratedType2.Project);
 		}
 	}

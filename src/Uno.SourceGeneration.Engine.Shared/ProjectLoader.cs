@@ -34,6 +34,7 @@ using System.Linq;
 using System.Collections.Concurrent;
 using static Microsoft.Extensions.Logging.LoggerExtensions;
 using Uno.SourceGeneratorTasks;
+using System.Reflection.Metadata;
 
 namespace Uno.SourceGeneration.Host
 {
@@ -66,6 +67,12 @@ namespace Uno.SourceGeneration.Host
 						_log.LogDebug($"Reloading project file details [{environment.ProjectFile}] as one of its imports has been modified.");
 					}
 				}
+			}
+
+			// Merge additional properties
+			foreach(var prop in environment.AdditionalProperties)
+			{
+				globalProperties[prop.Key] = prop.Value;
 			}
 
 			if (_log.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
@@ -149,7 +156,7 @@ namespace Uno.SourceGeneration.Host
 			var hostServices = new Microsoft.Build.Execution.HostServices();
 
 			// connect the host "callback" object with the host services, so we get called back with the exact inputs to the compiler task.
-			hostServices.RegisterHostObject(loadedProject.FullPath, "CoreCompile", "Csc", null);
+			hostServices.RegisterHostObject(loadedProject.FullPath, "CoreCompile", "Csc", (ITaskHost)null);
 
 			var buildParameters = new Microsoft.Build.Execution.BuildParameters(loadedProject.ProjectCollection);
 
@@ -176,7 +183,7 @@ namespace Uno.SourceGeneration.Host
 					}
 
 					LogFailedTargets(environment.ProjectFile, result);
-					details.Generators = new (Type, Func<SourceGenerator>)[0];
+					details.Generators = new (Type, Func<SourceGenerator>, Func<ISourceGenerator>)[0];
 					return details;
 				}
 				// else
@@ -234,7 +241,7 @@ namespace Uno.SourceGeneration.Host
 
 				LogFailedTargets(environment.ProjectFile, result);
 
-				details.Generators = new (Type, Func<SourceGenerator>)[0];
+				details.Generators = new (Type, Func<SourceGenerator>, Func<ISourceGenerator>)[0];
 			}
 
 			_allProjects.TryAdd(key, details);
@@ -292,9 +299,9 @@ namespace Uno.SourceGeneration.Host
 			}
 		}
 
-		private static (Type, Func<SourceGenerator>)[] LoadAnalyzers(IEnumerable<string> enumerable)
+		private static (Type, Func<SourceGenerator>, Func<ISourceGenerator>)[] LoadAnalyzers(IEnumerable<string> enumerable)
 		{
-			var generators = new List<(Type, Func<SourceGenerator>)>();
+			var generators = new List<(Type, Func<SourceGenerator>, Func<ISourceGenerator>)>();
 
 			foreach (var analyzerAsm in enumerable.Where(ContainsGenerators))
 			{
@@ -321,12 +328,18 @@ namespace Uno.SourceGeneration.Host
 
 						var q = from type in asm.GetTypes()
 								where !type.IsAbstract
-								where type.GetBaseTypes().Any(c => c.FullName == typeof(SourceGenerator).FullName)
-								select type;
+								let isUnoSourceGenerator = IsTypeUnoGenerators(type)
+								let isRoslynSourceGenerator = IsTypeRoslynGenerator(type)
+								where isUnoSourceGenerator || isRoslynSourceGenerator
+								select (type, isUnoSourceGenerator, isRoslynSourceGenerator);
 
 						generators.AddRange(
 							q.Select(t =>
-								(t, new Func<SourceGenerator>(() =>(SourceGenerator)Activator.CreateInstance(t)))
+								(
+									t.type,
+									t.isUnoSourceGenerator ? new Func<SourceGenerator>(() => (SourceGenerator)Activator.CreateInstance(t.type)) : null,
+									t.isRoslynSourceGenerator ? new Func<ISourceGenerator>(() => (ISourceGenerator)Activator.CreateInstance(t.type)) : null
+								)
 							)
 						);
 
@@ -354,6 +367,12 @@ namespace Uno.SourceGeneration.Host
 			return generators.ToArray();
 		}
 
+		private static bool IsTypeRoslynGenerator(Type type)
+			=> type.GetInterfaces().Any(i => i.FullName == typeof(ISourceGenerator).FullName);
+
+		private static bool IsTypeUnoGenerators(Type type)
+			=> type.GetBaseTypes().Any(c => c.FullName == typeof(SourceGenerator).FullName);
+
 		private static bool ContainsGenerators(string assembly)
 		{
 			try
@@ -361,7 +380,8 @@ namespace Uno.SourceGeneration.Host
 				_log.LogInformation($"Checking [{assembly}]");
 				var definition = Mono.Cecil.AssemblyDefinition.ReadAssembly(assembly);
 
-				return definition.MainModule.Types.Any(t => t.BaseType?.FullName == typeof(SourceGenerator).FullName);
+				return definition.MainModule.Types
+					.Any(t => t.BaseType?.FullName == typeof(SourceGenerator).FullName || t.Interfaces.Any(i => GetInterfaceTypeName(i) == typeof(ISourceGenerator).FullName));
 			}
 			catch (Exception e)
 			{
@@ -369,6 +389,19 @@ namespace Uno.SourceGeneration.Host
 				return false;
 			}
 		}
+
+#if NETFRAMEWORK
+		// Required to keep using an older version of Cecil.
+		private static string GetInterfaceTypeName(Mono.Cecil.TypeReference i)
+		{
+			return i.FullName;
+		}
+#else
+		private static string GetInterfaceTypeName(Mono.Cecil.InterfaceImplementation i)
+		{
+			return i.InterfaceType.FullName;
+		}
+#endif
 
 		private static MSBE.BuildResult BuildAsync(MSBE.BuildParameters parameters, MSBE.BuildRequestData requestData)
 		{

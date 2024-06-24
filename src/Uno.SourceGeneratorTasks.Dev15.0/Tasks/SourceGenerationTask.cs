@@ -88,11 +88,13 @@ namespace Uno.SourceGeneratorTasks
 		[Required]
 		public Microsoft.Build.Framework.ITaskItem[] ReferencePath { get; set; }
 
+		[Required]
+		public Microsoft.Build.Framework.ITaskItem[] AdditionalProperties { get; set; }
+
 		[Output]
 		public string[] GenereratedFiles { get; set; }
 
 		private CancellationTokenSource _sharedCompileCts;
-		private TaskLoggerProvider _taskLogger;
 
 		public override bool Execute()
 		{
@@ -123,7 +125,7 @@ namespace Uno.SourceGeneratorTasks
 				}
 				else
 				{
-					GenerateInProcess();
+					throw new Exception("In-process generation is not supported");
 				}
 
 				return true;
@@ -179,9 +181,6 @@ namespace Uno.SourceGeneratorTasks
 		{
 			Log.LogMessage(MessageImportance.Low, "Using host controller generation mode");
 
-			var taskLogger = new TaskLoggerProvider() { TaskLog = Log };
-			LogExtensionPoint.AmbientLoggerFactory.AddProvider(taskLogger);
-
 			using (_sharedCompileCts = new CancellationTokenSource())
 			{
 				var responseFile = Path.GetTempFileName();
@@ -214,7 +213,7 @@ namespace Uno.SourceGeneratorTasks
 
 					responseTask.Wait(_sharedCompileCts.Token);
 
-					BinaryLoggerReplayHelper.Replay(BuildEngine, binlogFile);
+					BinaryLoggerReplayHelper.Replay(BuildEngine, binlogFile, Log);
 
 					if (responseTask.Result.Type == GenerationResponse.ResponseType.Completed)
 					{
@@ -247,9 +246,6 @@ namespace Uno.SourceGeneratorTasks
 		private void GenerateWithHost()
 		{
 			Log.LogMessage(MessageImportance.Low, $"Using single-use host generation mode");
-
-			var taskLogger = new TaskLoggerProvider() { TaskLog = Log };
-			LogExtensionPoint.AmbientLoggerFactory.AddProvider(taskLogger);
 
 			var captureHostOutput = false;
 			if (!bool.TryParse(this.CaptureGenerationHostOutput, out captureHostOutput))
@@ -323,7 +319,7 @@ namespace Uno.SourceGeneratorTasks
 						var error = process.StandardError.ReadToEnd();
 						process.WaitForExit();
 
-						this.Log().Info(
+						Log.LogMessage(
 							$"Executing {startInfo.FileName} {startInfo.Arguments}:\n" +
 							$"result: {process.ExitCode}\n" +
 							$"\n---begin host output---\n{output}\n" +
@@ -337,7 +333,7 @@ namespace Uno.SourceGeneratorTasks
 						process.WaitForExit();
 					}
 
-					BinaryLoggerReplayHelper.Replay(BuildEngine, binlogFile);
+					BinaryLoggerReplayHelper.Replay(BuildEngine, binlogFile, Log);
 
 					if (process.ExitCode == 0)
 					{
@@ -361,15 +357,29 @@ namespace Uno.SourceGeneratorTasks
 		private string GetHostPath()
 		{
 			var currentPath = Path.GetDirectoryName(new Uri(GetType().Assembly.CodeBase).LocalPath);
-			var hostPlatform = RuntimeHelpers.IsNetCore ? "netcoreapp2.1" : "net461";
-			var installedPath = Path.Combine(currentPath, "..", "host", hostPlatform);
+			var hostPlatform = "net472";
+			if (RuntimeHelpers.IsNetCore)
+			{
+				var fx = RuntimeInformation.FrameworkDescription;
+				if (fx.StartsWith(".NET Core", StringComparison.OrdinalIgnoreCase))
+				{
+					hostPlatform = "netcoreapp3.1";
+				}
+				else if (fx.StartsWith(".NET ", StringComparison.OrdinalIgnoreCase))
+				{
+					var version = fx[5];
+					// net6 is the latest being shipped and we have <RollForward>LatestMajor</RollForward>
+					hostPlatform = (version > '6') ? "net6" : "net" + version;
+				}
+			}
+			var installedPath = Path.Combine(currentPath, "..", "..", "host", hostPlatform);
 #if DEBUG
 			var configuration = "Debug";
 #else
 			var configuration = "Release";
 #endif
 
-			var devPath = Path.Combine(currentPath, "..", "..", "..", "Uno.SourceGeneration.Host", "bin", configuration, hostPlatform);
+			var devPath = Path.Combine(currentPath, "..", "..", "..", "..", "Uno.SourceGeneration.Host", "bin", configuration, hostPlatform);
 
 			if (Directory.Exists(devPath))
 			{
@@ -383,20 +393,6 @@ namespace Uno.SourceGeneratorTasks
 			{
 				throw new InvalidOperationException($"Unable to find Uno.SourceGeneration.Host.dll (in {devPath} or {installedPath})");
 			}
-		}
-
-		private void GenerateInProcess()
-		{
-			Log.LogMessage(MessageImportance.Low, $"Using in-process generation mode");
-
-			var generationInfo = CreateDomain();
-
-			_taskLogger = new TaskLoggerProvider() { TaskLog = Log };
-			LogExtensionPoint.AmbientLoggerFactory.AddProvider(_taskLogger);
-
-			var remotableLogger = new Logger.RemotableLogger2(_taskLogger.CreateLogger("Logger.RemotableLogger"));
-
-			GenereratedFiles = generationInfo.Wrapper.Generate(remotableLogger, CreateBuildEnvironment());
 		}
 
 		public bool IsMonoMSBuildCompatible =>
@@ -436,56 +432,14 @@ namespace Uno.SourceGeneratorTasks
 				MSBuildBinPath = Path.GetDirectoryName(new Uri(typeof(Microsoft.Build.Logging.ConsoleLogger).Assembly.CodeBase).LocalPath),
 				AdditionalAssemblies = AdditionalAssemblies,
 				SourceGenerators = SourceGenerators,
-				ReferencePath = ReferencePath.Select(r => r.ItemSpec).ToArray()
+				ReferencePath = ReferencePath.Select(r => r.ItemSpec).ToArray(),
+				AdditionalProperties = AdditionalProperties
+					.ToDictionary(v => v.ItemSpec, v => v.GetMetadata("Value")),
 			};
 
 		private string EnsureRootedPath(string projectFile, string targetPath) =>
 			Path.IsPathRooted(targetPath)
 			? targetPath
 			: Path.Combine(Path.GetDirectoryName(projectFile), targetPath);
-
-		private (RemoteSourceGeneratorEngine Wrapper, AppDomain Domain) CreateDomain()
-		{
-			var generatorLocations = SourceGenerators.Select(Path.GetFullPath).Select(Path.GetDirectoryName).Distinct();
-			var wrapperBasePath = Path.GetDirectoryName(new Uri(typeof(RemoteSourceGeneratorEngine).Assembly.CodeBase).LocalPath);
-
-			// We can create an app domain per OwnerFile and all Analyzers files
-			// so that if those change, we can spin off another one, and still avoid
-			// locking these assemblies.
-			//
-			// If the domain exists, keep it and continue generating content with it.
-
-			var setup = new AppDomainSetup();
-			setup.ApplicationBase = wrapperBasePath;
-			setup.ShadowCopyFiles = "true";
-			setup.ShadowCopyDirectories = string.Join(";", generatorLocations) + ";" + wrapperBasePath;
-			setup.PrivateBinPath = setup.ShadowCopyDirectories;
-			setup.ConfigurationFile = Path.Combine(wrapperBasePath, typeof(RemoteSourceGeneratorEngine).Assembly.GetName().Name + ".dll.config");
-
-			// Loader optimization must not use MultiDomainHost, otherwise MSBuild assemblies may
-			// be shared incorrectly when multiple versions are loaded in different domains.
-			// The loader must specify SingleDomain, otherwise in contexts where devenv.exe is the
-			// current process, the default optimization is "MultiDomain" and assemblies are 
-			// incorrectly reused.
-			setup.LoaderOptimization = LoaderOptimization.SingleDomain;
-
-			var domain = AppDomain.CreateDomain("Generators-" + Guid.NewGuid(), null, setup);
-
-			Log.LogMessage($"[{Process.GetCurrentProcess().ProcessName}] Creating object {typeof(RemoteSourceGeneratorEngine).Assembly.CodeBase} with {typeof(RemoteSourceGeneratorEngine).FullName}. wrapperBasePath {wrapperBasePath} ");
-
-			var newHost = domain.CreateInstanceFromAndUnwrap(
-				typeof(RemoteSourceGeneratorEngine).Assembly.CodeBase,
-				typeof(RemoteSourceGeneratorEngine).FullName
-			) as RemoteSourceGeneratorEngine;
-
-			var msbuildBasePath = Path.GetDirectoryName(new Uri(typeof(Microsoft.Build.Logging.ConsoleLogger).Assembly.CodeBase).LocalPath);
-
-			newHost.MSBuildBasePath = msbuildBasePath;
-			newHost.AdditionalAssemblies = AdditionalAssemblies;
-
-			newHost.Initialize();
-
-			return (newHost, domain);
-		}
 	}
 }

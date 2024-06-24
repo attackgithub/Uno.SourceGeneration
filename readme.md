@@ -6,6 +6,8 @@ msbuild task which executes the SourceGenerators.
 
 It provides a way to generate C# source code based on a project being built, using all of its syntactic and semantic model information.
 
+The Uno Source Generator also supports the [Roslyn 3.8 (C# 9.0) Source Generator APIs](https://github.com/dotnet/roslyn/blob/master/docs/features/source-generators.cookbook.md), see below for more details. Note that as of Roslyn 3.8, generators do not support multi-pass generation where generators can depend on each others. In order to benefit from this feature, a generator must run using Uno.SourceGenerationTasks.
+
 Using this generator allows for a set of generators to share the same Roslyn compilation context, which is particularly expensive to create, and run all the generators in parallel.
 
 The `Uno.SourceGeneratorTasks` support updating generators on the fly, making iterative development easier as visual studio or MSBuild will not lock the generator's assemblies.
@@ -13,14 +15,13 @@ The `Uno.SourceGeneratorTasks` support updating generators on the fly, making it
 The `Uno.SourceGeneratorTasks` support any target framework for code generation, though there are limitations when [using a mixed targetframeworks graph](https://github.com/dotnet/roslyn/issues/23114), such as generating code
 in a `net47` project that references a `netstandard2.0` project. In such cases, prefer adding a `net47` target instead of targeting `netstandard2.0`.
 
-Visual Studio 2017 15.3+ for Windows, macOS and Linux builds are supported.
+Visual Studio 2017 15.3+ for Windows, macOS and Linux builds are supported. Building for .NET Core requires .NET 3.0.100 or later.
 
 ## Build status
 
-| Target | Branch | Status | Build output (artifacts) |
-| ------ | ------ | ------ | ----- |
-| development | master |[![Build status](https://ci.appveyor.com/api/projects/status/0jsq4wg0ce7a5rqu/branch/master?svg=true)](https://ci.appveyor.com/project/nventivedevops/uno-sourcegeneration/branch/master) <br> ![Build Stats](https://buildstats.info/appveyor/chart/nventivedevops/uno-sourcegeneration?branch=master&includeBuildsFromPullRequest=false) | [Appveyor - master](https://ci.appveyor.com/project/nventivedevops/uno-sourcegeneration/branch/master/artifacts)
-| stable | stable |[![Build status](https://ci.appveyor.com/api/projects/status/0jsq4wg0ce7a5rqu/branch/stable?svg=true)](https://ci.appveyor.com/project/nventivedevops/uno-sourcegeneration/branch/stable) <br> ![Build Stats](https://buildstats.info/appveyor/chart/nventivedevops/uno-sourcegeneration?branch=stable&includeBuildsFromPullRequest=false) | [Appveyor - stable](https://ci.appveyor.com/project/nventivedevops/uno-sourcegeneration/branch/stable/artifacts)
+| Target | Branch | Status |
+| ------ | ------ | ------ |
+| development | master |[![Build Status](https://dev.azure.com/uno-platform/Uno%20Platform/_apis/build/status/Uno%20Platform/Uno.SourceGeneration%20CI?branchName=master)](https://dev.azure.com/uno-platform/Uno%20Platform/_build/latest?definitionId=32&branchName=master)
 
 ## Nuget Packages
 
@@ -28,6 +29,8 @@ Visual Studio 2017 15.3+ for Windows, macOS and Linux builds are supported.
 | -- | -- | -- |
 | `Uno.SourceGeneration` | [![NuGet](https://img.shields.io/nuget/v/Uno.SourceGeneration.svg)](https://www.nuget.org/packages/Uno.SourceGeneration/) | Use this package to create a generator |
 | `Uno.SourceGenerationTasks` | [![NuGet](https://img.shields.io/nuget/v/Uno.SourceGenerationTasks.svg)](https://www.nuget.org/packages/Uno.SourceGenerationTasks/) | Use this package to use a generator |
+
+Experimental packages are available through this NuGet feed: https://pkgs.dev.azure.com/uno-platform/Uno%20Platform/_packaging/unoplatformdev/nuget/v3/index.json
 
 ## Creating a Source Generator
 
@@ -135,6 +138,46 @@ Packaging the generator in nuget requires to :
         ```
         This will allow for the generator package to be installed on any target framework.
 
+## Creating a C# 9.0 compatible generator
+
+Based on [C# 9.0 generators](https://github.com/dotnet/roslyn/blob/master/docs/features/source-generators.cookbook.md) the bootstrapper defines a set of APIs that are compatible with Roslyn.
+
+Here's a roslyn compatible generator:
+```csharp
+[Generator]
+public class CustomGenerator : ISourceGenerator
+{
+    public void Initialize(GeneratorInitializationContext context) {}
+
+    public void Execute(GeneratorExecutionContext context)
+    {
+        context.AddSource("myGeneratedFile.cs", @"
+namespace GeneratedNamespace
+{
+    public class GeneratedClass
+    {
+        public static void GeneratedMethod()
+        {
+            // generated code
+        }
+    }
+}");
+    }
+}
+```
+
+Uno also provides a set of methods giving access [to the MSBuild properties and items](https://github.com/dotnet/roslyn/blob/master/docs/features/source-generators.cookbook.md#consume-msbuild-properties-and-metadata), compatible Uno's source generation tasks:
+```csharp
+public void Execute(GeneratorExecutionContext context)
+{
+	var myProperty = context.GetMSBuildPropertyValue("MyTestProperty");
+
+    var myItems = context.GetMSBuildPropertyValue("GetMSBuildItems").Select(i => i.Identity);
+}
+```
+
+Note that the a generator running under Uno.SourceGenerationTasks does not need to define in MSBuild which properties need to be used, whereas C# 9.0 requires it.
+
 ## Debugging a generator
 
 In your generator, add the following in the `SourceGenerator.Execute` override :
@@ -203,9 +246,34 @@ You can write to build output using the following code:
     }
 ```
 
+## Available Properties
+
+The source generation task provides set of properties that can alter its behavior based on your project.
+
+### UnoSourceGeneratorAdditionalProperty
+
+The `UnoSourceGeneratorAdditionalProperty` item group provides the ability for a project to enable the
+propagation of specific properties to the generators. This may be required if properties are 
+[injected dynamically](https://github.com/Microsoft/VSProjectSystem/blob/master/doc/extensibility/IProjectGlobalPropertiesProvider.md#iprojectglobalpropertiesprovider),
+or provided as global variables.
+
+A good example of this is the `JavaSdkDirectory` that is generally injected as a global parameter through
+the msbuild command line.
+
+In such as case, add the following in your project file:
+
+```xml
+<ItemGroup>
+    <UnoSourceGeneratorAdditionalProperty Include="JavaSdkDirectory" />
+</ItemGroup>
+```
+
+In this case, the `JavaSdkDirectory` value will be captured in the original build environment, and provided
+to the generators' build environment.
+
 ## Troubleshooting
 
-## Error: `Failed to analyze project file ..., the targets ... failed to execute.`
+### Error: `Failed to analyze project file ..., the targets ... failed to execute.`
 
 This is issue is caused by a [open Roslyn issue](https://github.com/nventive/Uno.SourceGeneration/issues/2)
 for which all projects of the solution must have all the possible "head" projects configuration.
